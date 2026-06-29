@@ -79,6 +79,12 @@ SESSION_RESUMPTION_ENABLED = True
 TRANSCRIPT_LOG_ENABLED = True
 TRANSCRIPT_DIR = "transcripts"
 
+# Exit summary. On quit, JARVIS makes a single (non-Live) generation call to
+# summarize the session and append it to the transcript. SUMMARY_MODEL is a
+# plain text model, distinct from the Live MODEL above — swap if it 404s.
+EXIT_SUMMARY_ENABLED = True
+SUMMARY_MODEL = "gemini-3.1-flash"
+
 # Persistent memory. JARVIS can remember durable facts about you across runs;
 # they're stored here and folded into his system instruction on startup.
 # (Part of the local-function tools — requires ENABLE_LOCAL_FUNCTIONS.)
@@ -657,17 +663,22 @@ class Jarvis:
         self.last_interaction = time.monotonic()
         # Session resumption: handle issued by the server, reused on reconnect.
         self.resume_handle: str | None = None
-        # Transcript logging: per-utterance buffers + the open log file.
+        # Transcript logging: per-utterance buffers, the open log file, its
+        # path, and an in-memory copy of the conversation for the exit summary.
         self.user_buf = ""
         self.jarvis_buf = ""
+        self.log_path: str | None = None
+        self.transcript_lines: list[str] = []
         self.log_file = self._open_log() if TRANSCRIPT_LOG_ENABLED else None
 
     # ----- transcript logging --------------------------------------------- #
     def _open_log(self):
         os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
-        path = os.path.join(TRANSCRIPT_DIR, time.strftime("jarvis-%Y%m%d-%H%M%S.log"))
-        handle = open(path, "a", encoding="utf-8")
-        print(f"Transcript: {path}")
+        self.log_path = os.path.join(
+            TRANSCRIPT_DIR, time.strftime("jarvis-%Y%m%d-%H%M%S.log")
+        )
+        handle = open(self.log_path, "a", encoding="utf-8")
+        print(f"Transcript: {self.log_path}")
         return handle
 
     def _log(self, line: str) -> None:
@@ -680,6 +691,36 @@ class Jarvis:
         text = text.strip()
         if text:
             self._log(f"{who}: {text}")
+            self.transcript_lines.append(f"{who}: {text}")
+
+    def write_exit_summary(self) -> None:
+        """Summarize the session with one text-model call; append to the log.
+
+        Synchronous and best-effort — called after the event loop has closed,
+        so it never blocks shutdown and never raises.
+        """
+        if not self.transcript_lines:
+            return
+        conversation = "\n".join(self.transcript_lines)
+        prompt = (
+            "Summarize this voice-assistant session in 2-3 sentences, then, if "
+            "any, list durable facts about the user worth remembering as bullet "
+            "points. Be concise.\n\n" + conversation
+        )
+        try:
+            response = client.models.generate_content(
+                model=SUMMARY_MODEL, contents=prompt
+            )
+            summary = (response.text or "").strip()
+        except Exception as exc:  # noqa: BLE001 — never let shutdown fail
+            print(f"(Could not generate session summary: {exc})")
+            return
+        if not summary:
+            return
+        print(f"\nSession summary:\n{summary}\n")
+        if self.log_path:
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n=== Session summary ===\n{summary}\n")
 
     # ----- task 1: capture microphone ------------------------------------- #
     async def capture_mic(self) -> None:
@@ -952,6 +993,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--no-search", action="store_true", help="disable Google Search")
     p.add_argument("--no-code", action="store_true", help="disable code execution")
     p.add_argument("--no-shell", action="store_true", help="disable the shell tool")
+    p.add_argument("--no-summary", action="store_true", help="disable the exit summary")
     p.add_argument("--list-voices", action="store_true", help="print voices and exit")
     return p.parse_args(argv)
 
@@ -961,7 +1003,7 @@ def apply_overrides(a: argparse.Namespace) -> None:
     global MODEL, VOICE, WAKE_KEYWORD, WAKE_SENSITIVITY, SLEEP_AFTER_SILENCE
     global WAKE_WORD_ENABLED, WAKE_CHIME_ENABLED, TRANSCRIPT_LOG_ENABLED
     global SESSION_RESUMPTION_ENABLED, ENABLE_LOCAL_FUNCTIONS, ENABLE_GOOGLE_SEARCH
-    global ENABLE_CODE_EXECUTION, ENABLE_SHELL, WAKE_CHIME
+    global ENABLE_CODE_EXECUTION, ENABLE_SHELL, WAKE_CHIME, EXIT_SUMMARY_ENABLED
     if a.model:
         MODEL = a.model
     if a.voice:
@@ -980,6 +1022,7 @@ def apply_overrides(a: argparse.Namespace) -> None:
     ENABLE_GOOGLE_SEARCH = ENABLE_GOOGLE_SEARCH and not a.no_search
     ENABLE_CODE_EXECUTION = ENABLE_CODE_EXECUTION and not a.no_code
     ENABLE_SHELL = ENABLE_SHELL and not a.no_shell
+    EXIT_SUMMARY_ENABLED = EXIT_SUMMARY_ENABLED and not a.no_summary
     # Recompute the derived chime sample after toggles.
     WAKE_CHIME = _make_chime() if WAKE_CHIME_ENABLED else b""
 
@@ -1011,16 +1054,23 @@ def main() -> None:
             ("session resumption", SESSION_RESUMPTION_ENABLED),
             ("transcript log", TRANSCRIPT_LOG_ENABLED),
             ("wake chime", WAKE_CHIME_ENABLED),
+            ("exit summary", EXIT_SUMMARY_ENABLED),
         )
         if on
     ]
     if extras:
         print("Also on: " + ", ".join(extras))
     print()
+
+    jarvis = Jarvis()
     try:
-        asyncio.run(Jarvis().run())
+        asyncio.run(jarvis.run())
     except KeyboardInterrupt:
         print("\nVery good, sir.")
+    finally:
+        # The event loop is closed here, so this runs as a plain blocking call.
+        if EXIT_SUMMARY_ENABLED:
+            jarvis.write_exit_summary()
 
 
 if __name__ == "__main__":

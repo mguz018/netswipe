@@ -77,6 +77,18 @@ and tool-call events:
 
 The `transcripts/` directory is gitignored.
 
+### Exit summary
+
+When you quit, JARVIS makes a single **non-Live** generation call
+(`SUMMARY_MODEL`, default `gemini-3.1-flash`) to summarize the session in a
+couple of sentences plus any durable facts, prints it, and appends it to the
+transcript under a `=== Session summary ===` header. It runs after the event
+loop closes, so it never blocks shutdown, and any failure is reported without
+crashing. Toggle with `EXIT_SUMMARY_ENABLED` or `--no-summary`.
+
+`SUMMARY_MODEL` is a plain text model, **separate from the Live `MODEL`** — if
+it 404s on a preview rotation, update that one constant.
+
 ## Setup
 
 ### 1. System dependency: PortAudio
