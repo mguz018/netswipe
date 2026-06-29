@@ -11,18 +11,26 @@ Run:  python main.py
 Quit: Ctrl-C
 """
 
+import array
 import asyncio
+import math
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 
 import pyaudio
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+
+try:
+    import pvporcupine  # optional: only needed for the wake word
+except ImportError:
+    pvporcupine = None
 
 # --------------------------------------------------------------------------- #
 # Configuration — the knobs you'll most likely want to tweak.
@@ -44,6 +52,17 @@ VOICE = "Charon"
 ENABLE_LOCAL_FUNCTIONS = True   # open_app, read_file (run on THIS machine)
 ENABLE_GOOGLE_SEARCH = True     # web grounding (server-side)
 ENABLE_CODE_EXECUTION = True    # sandboxed code execution (server-side)
+
+# Wake word. When enabled, JARVIS ignores the mic until he hears his name —
+# nothing is streamed to the model while he's asleep. Detection runs fully
+# offline via Picovoice Porcupine ("jarvis" is one of its built-in keywords).
+# Needs a free access key from https://console.picovoice.ai in PICOVOICE_ACCESS_KEY.
+# If the package or key is missing, JARVIS falls back to always-listening.
+WAKE_WORD_ENABLED = True
+WAKE_KEYWORD = "jarvis"          # any of pvporcupine.KEYWORDS
+WAKE_SENSITIVITY = 0.5           # 0..1; higher = more sensitive, more false wakes
+SLEEP_AFTER_SILENCE = 12.0       # seconds of quiet before JARVIS dozes off again
+VOICE_RMS_THRESHOLD = 500        # mic loudness (int16 RMS) counted as "speech"
 
 # The whole personality lives here. Edit freely.
 SYSTEM_INSTRUCTION = """\
@@ -88,6 +107,8 @@ if not API_KEY:
     sys.exit(
         "GEMINI_API_KEY is not set. Copy .env.example to .env and add your key."
     )
+
+PICOVOICE_ACCESS_KEY = os.environ.get("PICOVOICE_ACCESS_KEY")
 
 client = genai.Client(api_key=API_KEY)
 
@@ -367,8 +388,47 @@ def list_available_voices() -> None:
     print(f"Currently using: {VOICE}\n")
 
 
+def make_wake_detector():
+    """Create a Porcupine wake-word detector, or None for always-on listening.
+
+    Falls back gracefully (with an explanatory message) if the wake word is
+    disabled, the package is missing, the access key is unset, or init fails —
+    in every fallback case JARVIS simply listens continuously.
+    """
+    if not WAKE_WORD_ENABLED:
+        return None
+    if pvporcupine is None:
+        print(
+            "Wake word requested but 'pvporcupine' is not installed; JARVIS "
+            "will listen continuously.  (pip install pvporcupine)"
+        )
+        return None
+    if not PICOVOICE_ACCESS_KEY:
+        print(
+            "Wake word requested but PICOVOICE_ACCESS_KEY is not set; JARVIS "
+            "will listen continuously.  (Free key: https://console.picovoice.ai)"
+        )
+        return None
+    try:
+        return pvporcupine.create(
+            access_key=PICOVOICE_ACCESS_KEY,
+            keywords=[WAKE_KEYWORD],
+            sensitivities=[WAKE_SENSITIVITY],
+        )
+    except Exception as exc:  # noqa: BLE001 — never let wake-word setup be fatal
+        print(f"Could not initialise wake word ({exc}); listening continuously.")
+        return None
+
+
+def _rms(pcm) -> float:
+    """Root-mean-square loudness of an int16 PCM frame."""
+    if not len(pcm):
+        return 0.0
+    return math.sqrt(sum(sample * sample for sample in pcm) / len(pcm))
+
+
 class Jarvis:
-    """Owns the audio devices and the four concurrent streaming tasks."""
+    """Owns the audio devices and the concurrent streaming tasks."""
 
     def __init__(self) -> None:
         self.audio = pyaudio.PyAudio()
@@ -377,10 +437,16 @@ class Jarvis:
         self.out_queue: asyncio.Queue = asyncio.Queue(maxsize=20)
         # Model audio waiting to be played to the speaker.
         self.audio_in_queue: asyncio.Queue = asyncio.Queue()
+        # Wake word. With no detector, JARVIS is always awake.
+        self.porcupine = make_wake_detector()
+        self.awake = self.porcupine is None
+        self.last_interaction = time.monotonic()
 
     # ----- task 1: capture microphone ------------------------------------- #
     async def capture_mic(self) -> None:
         mic_info = self.audio.get_default_input_device_info()
+        # Porcupine must be fed its exact frame length; otherwise any size works.
+        frame_length = self.porcupine.frame_length if self.porcupine else CHUNK_SIZE
         stream = await asyncio.to_thread(
             self.audio.open,
             format=FORMAT,
@@ -388,14 +454,28 @@ class Jarvis:
             rate=SEND_SAMPLE_RATE,
             input=True,
             input_device_index=mic_info["index"],
-            frames_per_buffer=CHUNK_SIZE,
+            frames_per_buffer=frame_length,
         )
-        print("Listening, sir.\n")
+        if self.porcupine:
+            print(f'Asleep. Say "{WAKE_KEYWORD}" to wake me, sir.\n')
+        else:
+            print("Listening, sir.\n")
         try:
             while True:
                 data = await asyncio.to_thread(
-                    stream.read, CHUNK_SIZE, exception_on_overflow=False
+                    stream.read, frame_length, exception_on_overflow=False
                 )
+
+                # Asleep: listen only for the wake word; stream nothing.
+                if self.porcupine and not self.awake:
+                    if self.porcupine.process(array.array("h", data)) >= 0:
+                        self.wake_up()
+                    continue
+
+                # Awake: keep the session alive while the user is actually
+                # speaking, then stream the frame to the model.
+                if self.porcupine and _rms(array.array("h", data)) >= VOICE_RMS_THRESHOLD:
+                    self._touch()
                 await self.out_queue.put(data)
         finally:
             stream.stop_stream()
@@ -424,11 +504,13 @@ class Jarvis:
             turn = self.session.receive()
             async for response in turn:
                 if data := response.data:
+                    self._touch()  # JARVIS is talking — stay awake
                     self.audio_in_queue.put_nowait(data)
                     continue
 
                 server_content = response.server_content
                 if server_content is not None:
+                    self._touch()
                     transcription = server_content.output_transcription
                     if transcription and transcription.text:
                         print(transcription.text, end="", flush=True)
@@ -454,6 +536,28 @@ class Jarvis:
                 self.audio_in_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+    # ----- wake / sleep state (only active when a detector exists) -------- #
+    def _touch(self) -> None:
+        """Mark the conversation as active; resets the sleep timer."""
+        self.last_interaction = time.monotonic()
+
+    def wake_up(self) -> None:
+        self.awake = True
+        self._touch()
+        print("\n● Yes, sir? (listening)\n")
+
+    async def sleep_monitor(self) -> None:
+        """Return JARVIS to sleep after a quiet spell. No-op without a detector."""
+        if not self.porcupine:
+            return
+        while True:
+            await asyncio.sleep(0.5)
+            quiet_for = time.monotonic() - self.last_interaction
+            if self.awake and quiet_for > SLEEP_AFTER_SILENCE:
+                self.awake = False
+                self._drain_output()
+                print(f'\n○ Standing by. Say "{WAKE_KEYWORD}" to wake me, sir.\n')
 
     # ----- task 4: play model audio to the speaker ------------------------ #
     async def play_audio(self) -> None:
@@ -506,12 +610,15 @@ class Jarvis:
                 tg.create_task(self.send_audio())
                 tg.create_task(self.receive_audio())
                 tg.create_task(self.play_audio())
+                tg.create_task(self.sleep_monitor())
         except* asyncio.CancelledError:
             pass
         except* Exception as eg:  # TaskGroup wraps failures in an ExceptionGroup
             for exc in eg.exceptions:
                 traceback.print_exception(type(exc), exc, exc.__traceback__)
         finally:
+            if self.porcupine:
+                self.porcupine.delete()
             self.audio.terminate()
 
 
@@ -526,7 +633,10 @@ def main() -> None:
         )
         if on
     ]
-    print("Tools enabled: " + (", ".join(enabled) if enabled else "none") + "\n")
+    print("Tools enabled: " + (", ".join(enabled) if enabled else "none"))
+    if WAKE_WORD_ENABLED:
+        print(f'Wake word: "{WAKE_KEYWORD}"')
+    print()
     try:
         asyncio.run(Jarvis().run())
     except KeyboardInterrupt:

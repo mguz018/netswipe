@@ -53,14 +53,48 @@ python main.py
 On startup it prints the prebuilt voices it can find so you can audition them,
 then starts listening. Press **Ctrl-C** to quit.
 
+## Wake word — "JARVIS"
+
+By default JARVIS doesn't stream a thing until he hears his name. Wake-word
+detection runs **fully offline** via [Picovoice Porcupine](https://picovoice.ai/),
+which ships `"jarvis"` as one of its built-in keywords — no custom model needed.
+
+How it behaves:
+
+1. **Asleep** — the mic is read locally and checked for the wake word; nothing
+   is sent to the model.
+2. Say **"JARVIS"** → he wakes (`● Yes, sir?`) and starts streaming to the model.
+3. Talk normally. He stays awake while you're speaking and while he's replying.
+4. After `SLEEP_AFTER_SILENCE` seconds of quiet he dozes off again
+   (`○ Standing by.`) until the next "JARVIS".
+
+### Setup
+
+1. Add `pvporcupine` (already in `requirements.txt`).
+2. Get a **free** access key at https://console.picovoice.ai and put it in
+   `.env` as `PICOVOICE_ACCESS_KEY`.
+
+If the package or key is missing, JARVIS prints a notice and simply
+**listens continuously** — the wake word is a convenience, not a hard
+dependency.
+
+### Knobs (top of `main.py`)
+
+- `WAKE_WORD_ENABLED` — turn the wake word on/off
+- `WAKE_KEYWORD` — any of `pvporcupine.KEYWORDS` (e.g. `"computer"`, `"jarvis"`)
+- `WAKE_SENSITIVITY` — `0..1`; higher catches more, with more false wakes
+- `SLEEP_AFTER_SILENCE` — seconds of quiet before he sleeps again
+- `VOICE_RMS_THRESHOLD` — mic loudness counted as speech (keeps him awake)
+
 ## Customizing
 
-The three things you'll most likely want to change live as constants at the top
+The things you'll most likely want to change live as constants at the top
 of `main.py`:
 
 - `MODEL` — the Gemini Live model name
 - `VOICE` — the prebuilt voice (defaults to `"Charon"`, a measured deeper tone)
 - `SYSTEM_INSTRUCTION` — the personality
+- `WAKE_*` — the wake word (see above)
 
 ## Things likely to need adjusting on a preview API
 
