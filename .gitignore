@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Conversation transcripts
+transcripts/
+
 # Python
 __pycache__/
 *.py[cod]

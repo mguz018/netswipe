@@ -9,17 +9,53 @@ Speak, and JARVIS answers aloud: unfailingly polite, calm, bone-dry, and brief.
 
 ## How it works
 
-`main.py` runs four concurrent `asyncio` tasks inside a `TaskGroup`, passing
-audio between them over queues:
+`main.py` runs concurrent `asyncio` tasks inside a `TaskGroup`, passing audio
+between them over queues:
 
 1. **capture mic** — reads 16 kHz / 16-bit / mono PCM from your microphone
 2. **send audio** — streams those chunks to the Live session
 3. **receive audio** — pulls the model's 24 kHz audio + text transcript back
 4. **play audio** — plays the model's speech to your speakers
+5. **sleep monitor** — returns JARVIS to standby after a quiet spell
 
 When you talk over JARVIS (barge-in), the queued output audio is drained so he
 stops near-instantly. His words are also printed to the console as he speaks
 (via output transcription).
+
+## Highlights
+
+- **Native-audio, single model** — no STT/LLM/TTS pipeline.
+- **"JARVIS" wake word** — fully offline, with an audible wake chime.
+- **Tools** — open apps, read files, list directories, time, notifications,
+  plus Google Search grounding and code execution.
+- **Transcript logging** — both sides of every conversation, timestamped.
+- **Session resumption** — transparently reconnects (keeping context) when the
+  Live API hits its connection limit or the network blips.
+
+## Resilience — session resumption
+
+The Gemini Live API caps how long a single connection can stay open, and
+networks drop. With `SESSION_RESUMPTION_ENABLED` (default on), JARVIS asks the
+server for a resumption handle, and when a connection ends he **reconnects
+automatically using that handle** — so the conversation context carries over
+rather than resetting. Reconnects use exponential backoff (1s → 30s); a real
+Ctrl-C still exits cleanly.
+
+## Transcript logging
+
+With `TRANSCRIPT_LOG_ENABLED` (default on), each run writes a timestamped log to
+`transcripts/jarvis-YYYYMMDD-HHMMSS.log` capturing **both** sides of the
+conversation (input transcription is enabled for your words), plus wake/sleep
+and tool-call events:
+
+```
+[17:05:05] [wake]
+[17:05:08] You: what's the weather in Malibu
+[17:05:10] [tool] open_app({'name': 'Weather'})
+[17:05:11] JARVIS: Seventy-two and clear, sir. Shocking, for Malibu.
+```
+
+The `transcripts/` directory is gitignored.
 
 ## Setup
 
@@ -63,7 +99,8 @@ How it behaves:
 
 1. **Asleep** — the mic is read locally and checked for the wake word; nothing
    is sent to the model.
-2. Say **"JARVIS"** → he wakes (`● Yes, sir?`) and starts streaming to the model.
+2. Say **"JARVIS"** → a short chime plays, he wakes (`● Yes, sir?`), and starts
+   streaming to the model. (Chime toggled by `WAKE_CHIME_ENABLED`.)
 3. Talk normally. He stays awake while you're speaking and while he's replying.
 4. After `SLEEP_AFTER_SILENCE` seconds of quiet he dozes off again
    (`○ Standing by.`) until the next "JARVIS".

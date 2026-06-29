@@ -63,6 +63,18 @@ WAKE_KEYWORD = "jarvis"          # any of pvporcupine.KEYWORDS
 WAKE_SENSITIVITY = 0.5           # 0..1; higher = more sensitive, more false wakes
 SLEEP_AFTER_SILENCE = 12.0       # seconds of quiet before JARVIS dozes off again
 VOICE_RMS_THRESHOLD = 500        # mic loudness (int16 RMS) counted as "speech"
+WAKE_CHIME_ENABLED = True        # play a short rising tone when JARVIS wakes
+
+# Session resumption. When on, JARVIS transparently reconnects (reusing a
+# server-issued handle so the conversation context survives) instead of dying
+# when the Live API hits its per-connection time limit or the network blips.
+SESSION_RESUMPTION_ENABLED = True
+
+# Transcript logging. Writes a timestamped log of both sides of the
+# conversation to TRANSCRIPT_DIR. Enables input transcription so your words are
+# captured too.
+TRANSCRIPT_LOG_ENABLED = True
+TRANSCRIPT_DIR = "transcripts"
 
 # The whole personality lives here. Edit freely.
 SYSTEM_INSTRUCTION = """\
@@ -345,20 +357,35 @@ TOOLS = build_tools()
 # --------------------------------------------------------------------------- #
 # Live session configuration.
 # --------------------------------------------------------------------------- #
-CONFIG = types.LiveConnectConfig(
-    response_modalities=["AUDIO"],
-    system_instruction=types.Content(
-        parts=[types.Part(text=SYSTEM_INSTRUCTION)]
-    ),
-    speech_config=types.SpeechConfig(
-        voice_config=types.VoiceConfig(
-            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)
+def build_config(resume_handle: str | None = None) -> types.LiveConnectConfig:
+    """Build the Live config, optionally resuming a prior session by handle."""
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=types.Content(
+            parts=[types.Part(text=SYSTEM_INSTRUCTION)]
         ),
-    ),
-    # Stream a text transcript of what JARVIS says so we can print it.
-    output_audio_transcription=types.AudioTranscriptionConfig(),
-    tools=TOOLS,
-)
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE)
+            ),
+        ),
+        # Stream a text transcript of what JARVIS says so we can print it.
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        # Capture the user's words too, for the transcript log.
+        input_audio_transcription=(
+            types.AudioTranscriptionConfig() if TRANSCRIPT_LOG_ENABLED else None
+        ),
+        tools=TOOLS,
+        # Ask the server for resumption handles so we can reconnect seamlessly.
+        session_resumption=(
+            types.SessionResumptionConfig(handle=resume_handle)
+            if SESSION_RESUMPTION_ENABLED
+            else None
+        ),
+    )
+
+
+CONFIG = build_config()
 
 
 def list_available_voices() -> None:
@@ -427,6 +454,22 @@ def _rms(pcm) -> float:
     return math.sqrt(sum(sample * sample for sample in pcm) / len(pcm))
 
 
+def _make_chime() -> bytes:
+    """A short two-note rising chime as 24 kHz int16 PCM (the speaker rate)."""
+    sr = RECV_SAMPLE_RATE
+    ramp = sr // 100  # ~10 ms fade in/out to avoid clicks
+    samples: list[int] = []
+    for freq, dur in ((660, 0.09), (988, 0.12)):  # E5 -> B5
+        n = int(sr * dur)
+        for i in range(n):
+            env = max(0.0, min(1.0, min(i, n - i) / ramp))
+            samples.append(int(0.25 * 32767 * env * math.sin(2 * math.pi * freq * i / sr)))
+    return array.array("h", samples).tobytes()
+
+
+WAKE_CHIME = _make_chime() if WAKE_CHIME_ENABLED else b""
+
+
 class Jarvis:
     """Owns the audio devices and the concurrent streaming tasks."""
 
@@ -441,6 +484,31 @@ class Jarvis:
         self.porcupine = make_wake_detector()
         self.awake = self.porcupine is None
         self.last_interaction = time.monotonic()
+        # Session resumption: handle issued by the server, reused on reconnect.
+        self.resume_handle: str | None = None
+        # Transcript logging: per-utterance buffers + the open log file.
+        self.user_buf = ""
+        self.jarvis_buf = ""
+        self.log_file = self._open_log() if TRANSCRIPT_LOG_ENABLED else None
+
+    # ----- transcript logging --------------------------------------------- #
+    def _open_log(self):
+        os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
+        path = os.path.join(TRANSCRIPT_DIR, time.strftime("jarvis-%Y%m%d-%H%M%S.log"))
+        handle = open(path, "a", encoding="utf-8")
+        print(f"Transcript: {path}")
+        return handle
+
+    def _log(self, line: str) -> None:
+        if not self.log_file:
+            return
+        self.log_file.write(f"[{time.strftime('%H:%M:%S')}] {line}\n")
+        self.log_file.flush()
+
+    def _log_utterance(self, who: str, text: str) -> None:
+        text = text.strip()
+        if text:
+            self._log(f"{who}: {text}")
 
     # ----- task 1: capture microphone ------------------------------------- #
     async def capture_mic(self) -> None:
@@ -511,9 +579,21 @@ class Jarvis:
                 server_content = response.server_content
                 if server_content is not None:
                     self._touch()
-                    transcription = server_content.output_transcription
-                    if transcription and transcription.text:
-                        print(transcription.text, end="", flush=True)
+
+                    # The user's words (logged, not printed live).
+                    in_tx = server_content.input_transcription
+                    if in_tx and in_tx.text:
+                        self.user_buf += in_tx.text
+
+                    # JARVIS's words: log the user's line first (keeps the log
+                    # chronological), then print + buffer his reply.
+                    out_tx = server_content.output_transcription
+                    if out_tx and out_tx.text:
+                        if self.user_buf.strip():
+                            self._log_utterance("You", self.user_buf)
+                            self.user_buf = ""
+                        self.jarvis_buf += out_tx.text
+                        print(out_tx.text, end="", flush=True)
 
                     # Barge-in: the user started talking over JARVIS. Drop any
                     # audio we've buffered so playback stops near-instantly.
@@ -522,6 +602,23 @@ class Jarvis:
 
                     if server_content.turn_complete:
                         print()  # newline after a complete spoken turn
+                        if self.user_buf.strip():
+                            self._log_utterance("You", self.user_buf)
+                            self.user_buf = ""
+                        if self.jarvis_buf.strip():
+                            self._log_utterance("JARVIS", self.jarvis_buf)
+                            self.jarvis_buf = ""
+
+                # Session resumption handle — store the latest so we can
+                # reconnect without losing the conversation.
+                update = response.session_resumption_update
+                if update is not None and update.resumable and update.new_handle:
+                    self.resume_handle = update.new_handle
+
+                # The server is about to close this connection; the reconnect
+                # loop in run() will pick things back up using resume_handle.
+                if response.go_away is not None:
+                    print(f"\n[connection cycling: {response.go_away.time_left} left]")
 
                 # Local function calls (open_app / read_file). Built-in tools
                 # like Google Search and code execution resolve server-side and
@@ -545,7 +642,10 @@ class Jarvis:
     def wake_up(self) -> None:
         self.awake = True
         self._touch()
+        if WAKE_CHIME:
+            self.audio_in_queue.put_nowait(WAKE_CHIME)
         print("\n● Yes, sir? (listening)\n")
+        self._log("[wake]")
 
     async def sleep_monitor(self) -> None:
         """Return JARVIS to sleep after a quiet spell. No-op without a detector."""
@@ -558,6 +658,7 @@ class Jarvis:
                 self.awake = False
                 self._drain_output()
                 print(f'\n○ Standing by. Say "{WAKE_KEYWORD}" to wake me, sir.\n')
+                self._log("[sleep]")
 
     # ----- task 4: play model audio to the speaker ------------------------ #
     async def play_audio(self) -> None:
@@ -587,6 +688,7 @@ class Jarvis:
         responses = []
         for fc in tool_call.function_calls:
             print(f"\n[JARVIS: {fc.name}({dict(fc.args or {})})]")
+            self._log(f"[tool] {fc.name}({dict(fc.args or {})})")
             handler = TOOL_HANDLERS.get(fc.name)
             if handler is None:
                 result = {"status": "error", "error": f"Unknown function: {fc.name}"}
@@ -599,27 +701,60 @@ class Jarvis:
             )
         await self.session.send_tool_response(function_responses=responses)
 
+    async def _one_session(self) -> None:
+        """Run all streaming tasks against a single Live connection.
+
+        Returns only when the connection ends; on a drop the receive task
+        raises and the TaskGroup propagates an ExceptionGroup to the caller.
+        """
+        config = build_config(self.resume_handle)
+        async with (
+            client.aio.live.connect(model=MODEL, config=config) as session,
+            asyncio.TaskGroup() as tg,
+        ):
+            self.session = session
+            if self.resume_handle:
+                print("[reconnected]")
+                self._log("[reconnected]")
+            tg.create_task(self.capture_mic())
+            tg.create_task(self.send_audio())
+            tg.create_task(self.receive_audio())
+            tg.create_task(self.play_audio())
+            tg.create_task(self.sleep_monitor())
+
     async def run(self) -> None:
         try:
-            async with (
-                client.aio.live.connect(model=MODEL, config=CONFIG) as session,
-                asyncio.TaskGroup() as tg,
-            ):
-                self.session = session
-                tg.create_task(self.capture_mic())
-                tg.create_task(self.send_audio())
-                tg.create_task(self.receive_audio())
-                tg.create_task(self.play_audio())
-                tg.create_task(self.sleep_monitor())
-        except* asyncio.CancelledError:
-            pass
-        except* Exception as eg:  # TaskGroup wraps failures in an ExceptionGroup
-            for exc in eg.exceptions:
-                traceback.print_exception(type(exc), exc, exc.__traceback__)
+            backoff = 1.0
+            while True:
+                try:
+                    await self._one_session()
+                    return  # clean end (rare — the tasks loop forever)
+                except BaseExceptionGroup as eg:
+                    # Let a real shutdown (Ctrl-C / cancellation) through.
+                    cancelled, rest = eg.split(asyncio.CancelledError)
+                    if cancelled is not None:
+                        raise
+                    if not SESSION_RESUMPTION_ENABLED:
+                        if rest is not None:
+                            self._report(rest)
+                        return
+                    # Otherwise treat it as a dropped connection and reconnect.
+                    names = ", ".join(type(e).__name__ for e in rest.exceptions)
+                    print(f"\n[connection lost: {names}; reconnecting in {backoff:.0f}s]")
+                    self._log(f"[connection lost: {names}; reconnecting]")
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, 30.0)
         finally:
             if self.porcupine:
                 self.porcupine.delete()
+            if self.log_file:
+                self.log_file.close()
             self.audio.terminate()
+
+    @staticmethod
+    def _report(eg: BaseExceptionGroup) -> None:
+        for exc in eg.exceptions:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
 def main() -> None:
@@ -636,6 +771,17 @@ def main() -> None:
     print("Tools enabled: " + (", ".join(enabled) if enabled else "none"))
     if WAKE_WORD_ENABLED:
         print(f'Wake word: "{WAKE_KEYWORD}"')
+    extras = [
+        name
+        for name, on in (
+            ("session resumption", SESSION_RESUMPTION_ENABLED),
+            ("transcript log", TRANSCRIPT_LOG_ENABLED),
+            ("wake chime", WAKE_CHIME_ENABLED),
+        )
+        if on
+    ]
+    if extras:
+        print("Also on: " + ", ".join(extras))
     print()
     try:
         asyncio.run(Jarvis().run())
