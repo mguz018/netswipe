@@ -305,8 +305,12 @@ def load_memories() -> list:
 
 
 def save_memories(memories: list) -> None:
-    with open(MEMORY_FILE, "w", encoding="utf-8") as fh:
+    # Write-then-rename so a concurrent reader never sees a half-written file
+    # (rename is atomic on the same filesystem).
+    tmp = f"{MEMORY_FILE}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(memories, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, MEMORY_FILE)
 
 
 def remember(fact: str) -> dict:
@@ -562,9 +566,6 @@ def build_config(resume_handle: str | None = None) -> types.LiveConnectConfig:
     )
 
 
-CONFIG = build_config()
-
-
 def list_available_voices() -> None:
     """Best-effort print of selectable prebuilt voices, for auditioning.
 
@@ -746,16 +747,24 @@ class Jarvis:
                     stream.read, frame_length, exception_on_overflow=False
                 )
 
-                # Asleep: listen only for the wake word; stream nothing.
-                if self.porcupine and not self.awake:
-                    if self.porcupine.process(array.array("h", data)) >= 0:
-                        self.wake_up()
-                    continue
+                if self.porcupine:
+                    # A short/partial read would make array.array raise and
+                    # Porcupine reject the frame; just skip it.
+                    if len(data) != frame_length * 2:
+                        continue
+                    pcm = array.array("h", data)
 
-                # Awake: keep the session alive while the user is actually
-                # speaking, then stream the frame to the model.
-                if self.porcupine and _rms(array.array("h", data)) >= VOICE_RMS_THRESHOLD:
-                    self._touch()
+                    # Asleep: listen only for the wake word; stream nothing.
+                    if not self.awake:
+                        if self.porcupine.process(pcm) >= 0:
+                            self.wake_up()
+                        continue
+
+                    # Awake: keep the session alive while the user actually
+                    # speaks, then stream the frame to the model.
+                    if _rms(pcm) >= VOICE_RMS_THRESHOLD:
+                        self._touch()
+
                 await self.out_queue.put(data)
         finally:
             stream.stop_stream()
@@ -846,6 +855,17 @@ class Jarvis:
             except asyncio.QueueEmpty:
                 break
 
+    def _reset_session_state(self) -> None:
+        """Drop audio/transcript state that must not carry across a reconnect."""
+        self._drain_output()
+        while not self.out_queue.empty():
+            try:
+                self.out_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self.user_buf = ""
+        self.jarvis_buf = ""
+
     # ----- wake / sleep state (only active when a detector exists) -------- #
     def _touch(self) -> None:
         """Mark the conversation as active; resets the sleep timer."""
@@ -905,9 +925,14 @@ class Jarvis:
             if handler is None:
                 result = {"status": "error", "error": f"Unknown function: {fc.name}"}
             else:
-                # Handlers do blocking I/O (subprocess, file reads); keep them
-                # off the audio event loop.
-                result = await asyncio.to_thread(handler, **(fc.args or {}))
+                try:
+                    # Handlers do blocking I/O (subprocess, file reads); keep
+                    # them off the audio event loop. Any failure (including an
+                    # unexpected argument from the model) becomes an error
+                    # result rather than killing the receive task.
+                    result = await asyncio.to_thread(handler, **(fc.args or {}))
+                except Exception as exc:  # noqa: BLE001
+                    result = {"status": "error", "error": str(exc)}
             responses.append(
                 types.FunctionResponse(id=fc.id, name=fc.name, response=result)
             )
@@ -919,6 +944,10 @@ class Jarvis:
         Returns only when the connection ends; on a drop the receive task
         raises and the TaskGroup propagates an ExceptionGroup to the caller.
         """
+        # Clear per-session audio/transcript state so a reconnect doesn't send
+        # stale mic frames to the new session or splice a half-finished
+        # utterance from the old one onto the next.
+        self._reset_session_state()
         config = build_config(self.resume_handle)
         async with (
             client.aio.live.connect(model=MODEL, config=config) as session,

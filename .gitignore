@@ -6,6 +6,7 @@ transcripts/
 
 # Persistent memory
 memory.json
+memory.json.tmp
 
 # Python
 __pycache__/
