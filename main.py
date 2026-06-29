@@ -105,6 +105,22 @@ client = genai.Client(api_key=API_KEY)
 
 MAX_READ_BYTES = 100_000  # cap how much of a file we hand back to the model
 
+# read_file / list_directory may only touch paths under these roots. Add or
+# remove entries to taste; keep it as narrow as you can.
+ALLOWED_ROOTS = [
+    os.path.expanduser("~"),
+    os.getcwd(),
+]
+
+
+def _within_allowed_roots(resolved: str) -> bool:
+    """True if `resolved` (an absolute, real path) sits under an allowed root."""
+    for root in ALLOWED_ROOTS:
+        root = os.path.realpath(os.path.expanduser(root))
+        if os.path.commonpath([root, resolved]) == root:
+            return True
+    return False
+
 
 def open_app(name: str) -> dict:
     """Open an application on the local machine, cross-platform."""
@@ -136,9 +152,11 @@ def open_app(name: str) -> dict:
 
 
 def read_file(path: str) -> dict:
-    """Read a text file from the local machine (size-capped)."""
+    """Read a text file from the local machine (whitelisted, size-capped)."""
     try:
-        resolved = os.path.abspath(os.path.expanduser(path))
+        resolved = os.path.realpath(os.path.expanduser(path))
+        if not _within_allowed_roots(resolved):
+            return {"status": "error", "error": f"Access to '{path}' is not permitted."}
         if not os.path.isfile(resolved):
             return {"status": "error", "error": f"No such file: {path}"}
         size = os.path.getsize(resolved)
@@ -155,10 +173,71 @@ def read_file(path: str) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+def list_directory(path: str = "~") -> dict:
+    """List the entries of a directory (whitelisted)."""
+    try:
+        resolved = os.path.realpath(os.path.expanduser(path))
+        if not _within_allowed_roots(resolved):
+            return {"status": "error", "error": f"Access to '{path}' is not permitted."}
+        if not os.path.isdir(resolved):
+            return {"status": "error", "error": f"Not a directory: {path}"}
+        entries = sorted(os.listdir(resolved))
+        return {
+            "status": "ok",
+            "path": resolved,
+            "entries": entries[:500],
+            "count": len(entries),
+            "truncated": len(entries) > 500,
+        }
+    except Exception as exc:  # noqa: BLE001 — report any failure to the model
+        return {"status": "error", "error": str(exc)}
+
+
+def get_current_time() -> dict:
+    """Return the current local date and time."""
+    from datetime import datetime
+
+    now = datetime.now().astimezone()
+    return {
+        "status": "ok",
+        "iso": now.isoformat(timespec="seconds"),
+        "spoken": now.strftime("%A, %B %-d %Y, %-I:%M %p"),
+        "timezone": str(now.tzinfo),
+    }
+
+
+def send_notification(title: str, message: str) -> dict:
+    """Post a desktop notification, cross-platform (best effort)."""
+    system = platform.system()
+    try:
+        if system == "Darwin":  # macOS
+            script = f'display notification "{message}" with title "{title}"'
+            subprocess.Popen(["osascript", "-e", script])
+        elif system == "Windows":
+            ps = (
+                "[reflection.assembly]::LoadWithPartialName('System.Windows.Forms')|Out-Null;"
+                "$n=New-Object System.Windows.Forms.NotifyIcon;"
+                "$n.Icon=[System.Drawing.SystemIcons]::Information;"
+                "$n.Visible=$true;"
+                f"$n.ShowBalloonTip(5000,'{title}','{message}',[System.Windows.Forms.ToolTipIcon]::Info)"
+            )
+            subprocess.Popen(["powershell", "-NoProfile", "-Command", ps])
+        else:  # Linux and friends
+            if not shutil.which("notify-send"):
+                return {"status": "error", "error": "notify-send is not installed."}
+            subprocess.Popen(["notify-send", title, message])
+        return {"status": "ok"}
+    except Exception as exc:  # noqa: BLE001 — report any failure to the model
+        return {"status": "error", "error": str(exc)}
+
+
 # Maps a declared function name -> the local Python handler that runs it.
 TOOL_HANDLERS = {
     "open_app": open_app,
     "read_file": read_file,
+    "list_directory": list_directory,
+    "get_current_time": get_current_time,
+    "send_notification": send_notification,
 }
 
 # Function declarations the model is told about.
@@ -189,6 +268,40 @@ FUNCTION_DECLARATIONS = [
                 ),
             },
             required=["path"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_directory",
+        description="List the files and folders in a directory on the user's computer.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "path": types.Schema(
+                    type=types.Type.STRING,
+                    description="Directory to list (~ is expanded). Defaults to home.",
+                ),
+            },
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="get_current_time",
+        description="Get the current local date and time.",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
+    types.FunctionDeclaration(
+        name="send_notification",
+        description="Show a desktop notification on the user's computer.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "title": types.Schema(
+                    type=types.Type.STRING, description="Notification title."
+                ),
+                "message": types.Schema(
+                    type=types.Type.STRING, description="Notification body text."
+                ),
+            },
+            required=["title", "message"],
         ),
     ),
 ]

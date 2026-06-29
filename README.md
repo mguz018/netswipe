@@ -88,7 +88,12 @@ top of `main.py`:
 - **Local-machine functions** (`ENABLE_LOCAL_FUNCTIONS`)
   - `open_app(name)` — opens an application (cross-platform: `open -a` on macOS,
     `start` on Windows, the binary or `xdg-open` on Linux).
-  - `read_file(path)` — reads a text file (`~` expanded, capped at 100 KB).
+  - `read_file(path)` — reads a text file (`~` expanded, capped at 100 KB,
+    restricted to allowed roots — see below).
+  - `list_directory(path)` — lists a directory's entries (same restriction).
+  - `get_current_time()` — the current local date and time.
+  - `send_notification(title, message)` — a desktop notification (`osascript`
+    on macOS, `notify-send` on Linux, PowerShell balloon on Windows).
   - These run on **your machine**, dispatched locally by `handle_tool_call()`,
     and the result is returned to the model. See the security note below.
 - **Google Search grounding** (`ENABLE_GOOGLE_SEARCH`) — JARVIS can pull current
@@ -98,11 +103,13 @@ top of `main.py`:
 
 Each tool call is logged to the console (e.g. `[JARVIS: open_app({'name': 'Safari'})]`).
 
-> **Security note:** with local functions enabled, the model can open apps and
-> read files on your computer in response to what it hears on the mic. The
-> `read_file` handler is size-capped but **not** path-restricted. Tighten it
-> (whitelist directories) before using this anywhere untrusted, or set
-> `ENABLE_LOCAL_FUNCTIONS = False`.
+> **Security note:** with local functions enabled, the model can open apps,
+> read files, and post notifications on your computer in response to what it
+> hears on the mic. `read_file` / `list_directory` are confined to the roots in
+> `ALLOWED_ROOTS` (home directory and the working directory by default) and
+> reject path-traversal escapes via `realpath`. Narrow `ALLOWED_ROOTS` further
+> for untrusted environments, or set `ENABLE_LOCAL_FUNCTIONS = False`. Note that
+> `open_app` is **not** restricted — it can launch any installed application.
 
 > **If the API rejects combining tools:** some preview models don't allow
 > function declarations alongside built-in tools in one session. If you see an
