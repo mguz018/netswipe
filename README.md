@@ -109,6 +109,23 @@ python main.py
 On startup it prints the prebuilt voices it can find so you can audition them,
 then starts listening. Press **Ctrl-C** to quit.
 
+### Command-line options
+
+Everything configurable as a constant can also be set per-run, without editing
+the file:
+
+```bash
+python main.py --voice Orus --keyword computer   # audition a voice / wake word
+python main.py --model gemini-3.1-flash-live-preview
+python main.py --no-wake-word                    # listen continuously
+python main.py --no-search --no-code --no-shell  # trim capabilities
+python main.py --list-voices                     # print voices and exit
+```
+
+Run `python main.py --help` for the full list. Flags only *disable* features
+that are on by default; the constants at the top of `main.py` remain the source
+of defaults.
+
 ## Wake word — "JARVIS"
 
 By default JARVIS doesn't stream a thing until he hears his name. Wake-word
@@ -187,6 +204,10 @@ top of `main.py`:
     on macOS, `notify-send` on Linux, PowerShell balloon on Windows).
   - `remember(fact)` / `forget(fact)` / `list_memories()` — persistent memory
     across runs (see [Persistent memory](#persistent-memory)).
+  - `run_shell(command)` — runs a **whitelisted, read-only** command
+    (`ENABLE_SHELL`; allowlist in `ALLOWED_SHELL_COMMANDS`). Args are passed
+    directly to the program — no shell, no pipes, no redirection — and output
+    is size- and time-capped.
   - These run on **your machine**, dispatched locally by `handle_tool_call()`,
     and the result is returned to the model. See the security note below.
 - **Google Search grounding** (`ENABLE_GOOGLE_SEARCH`) — JARVIS can pull current
@@ -197,8 +218,10 @@ top of `main.py`:
 Each tool call is logged to the console (e.g. `[JARVIS: open_app({'name': 'Safari'})]`).
 
 > **Security note:** with local functions enabled, the model can open apps,
-> read files, and post notifications on your computer in response to what it
-> hears on the mic. `read_file` / `list_directory` are confined to the roots in
+> read files, post notifications, and run whitelisted shell commands on your
+> computer in response to what it hears on the mic. `run_shell` only permits
+> the read-only programs in `ALLOWED_SHELL_COMMANDS` and never invokes a
+> shell, but treat the allowlist as a trust boundary — keep it narrow. `read_file` / `list_directory` are confined to the roots in
 > `ALLOWED_ROOTS` (home directory and the working directory by default) and
 > reject path-traversal escapes via `realpath`. Narrow `ALLOWED_ROOTS` further
 > for untrusted environments, or set `ENABLE_LOCAL_FUNCTIONS = False`. Note that

@@ -11,12 +11,14 @@ Run:  python main.py
 Quit: Ctrl-C
 """
 
+import argparse
 import array
 import asyncio
 import json
 import math
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -81,6 +83,18 @@ TRANSCRIPT_DIR = "transcripts"
 # they're stored here and folded into his system instruction on startup.
 # (Part of the local-function tools — requires ENABLE_LOCAL_FUNCTIONS.)
 MEMORY_FILE = "memory.json"
+
+# Shell command tool. Lets JARVIS run a *whitelisted* set of read-only,
+# informational commands (no pipes, no shell metacharacters — args are passed
+# directly to the program). Tighten or widen ALLOWED_SHELL_COMMANDS to taste.
+# (Part of the local-function tools — requires ENABLE_LOCAL_FUNCTIONS.)
+ENABLE_SHELL = True
+ALLOWED_SHELL_COMMANDS = {
+    "date", "uptime", "df", "free", "whoami", "hostname", "uname",
+    "ls", "pwd", "cal", "ps", "ifconfig", "ip",
+}
+SHELL_TIMEOUT = 10               # seconds before a command is killed
+MAX_SHELL_OUTPUT = 4_000         # chars of stdout/stderr returned to the model
 
 # The whole personality lives here. Edit freely.
 SYSTEM_INSTRUCTION = """\
@@ -317,6 +331,39 @@ def list_memories() -> dict:
     return {"status": "ok", "memories": load_memories()}
 
 
+def run_shell(command: str) -> dict:
+    """Run a whitelisted, read-only shell command (no pipes / metacharacters)."""
+    try:
+        parts = shlex.split(command or "")
+    except ValueError as exc:
+        return {"status": "error", "error": f"Could not parse command: {exc}"}
+    if not parts:
+        return {"status": "error", "error": "Empty command."}
+    program = os.path.basename(parts[0])
+    if program not in ALLOWED_SHELL_COMMANDS:
+        return {
+            "status": "error",
+            "error": f"Command '{program}' is not permitted.",
+            "allowed": sorted(ALLOWED_SHELL_COMMANDS),
+        }
+    try:
+        proc = subprocess.run(
+            parts, capture_output=True, text=True, timeout=SHELL_TIMEOUT
+        )
+        full = proc.stdout or ""
+        return {
+            "status": "ok",
+            "returncode": proc.returncode,
+            "stdout": full[:MAX_SHELL_OUTPUT],
+            "stderr": (proc.stderr or "")[:MAX_SHELL_OUTPUT],
+            "truncated": len(full) > MAX_SHELL_OUTPUT,
+        }
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": f"Command timed out after {SHELL_TIMEOUT}s."}
+    except Exception as exc:  # noqa: BLE001 — report any failure to the model
+        return {"status": "error", "error": str(exc)}
+
+
 # Maps a declared function name -> the local Python handler that runs it.
 TOOL_HANDLERS = {
     "open_app": open_app,
@@ -327,6 +374,7 @@ TOOL_HANDLERS = {
     "remember": remember,
     "forget": forget,
     "list_memories": list_memories,
+    "run_shell": run_shell,
 }
 
 # Function declarations the model is told about.
@@ -432,19 +480,38 @@ FUNCTION_DECLARATIONS = [
 ]
 
 
+SHELL_FUNCTION_DECLARATION = types.FunctionDeclaration(
+    name="run_shell",
+    description=(
+        "Run a whitelisted, read-only shell command on the user's computer "
+        "(e.g. date, df, uptime, ls). No pipes or redirection."
+    ),
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "command": types.Schema(
+                type=types.Type.STRING,
+                description="The command line to run, e.g. 'df -h'.",
+            ),
+        },
+        required=["command"],
+    ),
+)
+
+
 def build_tools() -> list:
-    """Assemble the tool list from the ENABLE_* capability flags."""
+    """Assemble the tool list from the ENABLE_* capability flags (read live)."""
     tools = []
     if ENABLE_LOCAL_FUNCTIONS:
-        tools.append(types.Tool(function_declarations=FUNCTION_DECLARATIONS))
+        declarations = list(FUNCTION_DECLARATIONS)
+        if ENABLE_SHELL:
+            declarations.append(SHELL_FUNCTION_DECLARATION)
+        tools.append(types.Tool(function_declarations=declarations))
     if ENABLE_GOOGLE_SEARCH:
         tools.append(types.Tool(google_search=types.GoogleSearch()))
     if ENABLE_CODE_EXECUTION:
         tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
     return tools
-
-
-TOOLS = build_tools()
 
 # --------------------------------------------------------------------------- #
 # Live session configuration.
@@ -479,7 +546,7 @@ def build_config(resume_handle: str | None = None) -> types.LiveConnectConfig:
         input_audio_transcription=(
             types.AudioTranscriptionConfig() if TRANSCRIPT_LOG_ENABLED else None
         ),
-        tools=TOOLS,
+        tools=build_tools(),
         # Ask the server for resumption handles so we can reconnect seamlessly.
         session_resumption=(
             types.SessionResumptionConfig(handle=resume_handle)
@@ -868,12 +935,68 @@ class Jarvis:
             traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 
+def parse_args(argv=None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="JARVIS — a real-time voice assistant on the Gemini Live API."
+    )
+    p.add_argument("--model", help=f"Gemini Live model (default: {MODEL})")
+    p.add_argument("--voice", help=f"prebuilt voice (default: {VOICE})")
+    p.add_argument("--keyword", help=f"wake word (default: {WAKE_KEYWORD})")
+    p.add_argument("--sensitivity", type=float, help="wake-word sensitivity 0..1")
+    p.add_argument("--sleep-after", type=float, help="seconds of quiet before sleep")
+    p.add_argument("--no-wake-word", action="store_true", help="listen continuously")
+    p.add_argument("--no-chime", action="store_true", help="disable the wake chime")
+    p.add_argument("--no-transcript", action="store_true", help="disable transcript log")
+    p.add_argument("--no-resume", action="store_true", help="disable session resumption")
+    p.add_argument("--no-tools", action="store_true", help="disable local functions")
+    p.add_argument("--no-search", action="store_true", help="disable Google Search")
+    p.add_argument("--no-code", action="store_true", help="disable code execution")
+    p.add_argument("--no-shell", action="store_true", help="disable the shell tool")
+    p.add_argument("--list-voices", action="store_true", help="print voices and exit")
+    return p.parse_args(argv)
+
+
+def apply_overrides(a: argparse.Namespace) -> None:
+    """Override module-level config from parsed CLI args."""
+    global MODEL, VOICE, WAKE_KEYWORD, WAKE_SENSITIVITY, SLEEP_AFTER_SILENCE
+    global WAKE_WORD_ENABLED, WAKE_CHIME_ENABLED, TRANSCRIPT_LOG_ENABLED
+    global SESSION_RESUMPTION_ENABLED, ENABLE_LOCAL_FUNCTIONS, ENABLE_GOOGLE_SEARCH
+    global ENABLE_CODE_EXECUTION, ENABLE_SHELL, WAKE_CHIME
+    if a.model:
+        MODEL = a.model
+    if a.voice:
+        VOICE = a.voice
+    if a.keyword:
+        WAKE_KEYWORD = a.keyword
+    if a.sensitivity is not None:
+        WAKE_SENSITIVITY = a.sensitivity
+    if a.sleep_after is not None:
+        SLEEP_AFTER_SILENCE = a.sleep_after
+    WAKE_WORD_ENABLED = WAKE_WORD_ENABLED and not a.no_wake_word
+    WAKE_CHIME_ENABLED = WAKE_CHIME_ENABLED and not a.no_chime
+    TRANSCRIPT_LOG_ENABLED = TRANSCRIPT_LOG_ENABLED and not a.no_transcript
+    SESSION_RESUMPTION_ENABLED = SESSION_RESUMPTION_ENABLED and not a.no_resume
+    ENABLE_LOCAL_FUNCTIONS = ENABLE_LOCAL_FUNCTIONS and not a.no_tools
+    ENABLE_GOOGLE_SEARCH = ENABLE_GOOGLE_SEARCH and not a.no_search
+    ENABLE_CODE_EXECUTION = ENABLE_CODE_EXECUTION and not a.no_code
+    ENABLE_SHELL = ENABLE_SHELL and not a.no_shell
+    # Recompute the derived chime sample after toggles.
+    WAKE_CHIME = _make_chime() if WAKE_CHIME_ENABLED else b""
+
+
 def main() -> None:
+    args = parse_args()
+    apply_overrides(args)
+
     list_available_voices()
+    if args.list_voices:
+        return
+
     enabled = [
         name
         for name, on in (
             ("local functions", ENABLE_LOCAL_FUNCTIONS),
+            ("shell", ENABLE_LOCAL_FUNCTIONS and ENABLE_SHELL),
             ("Google Search", ENABLE_GOOGLE_SEARCH),
             ("code execution", ENABLE_CODE_EXECUTION),
         )
