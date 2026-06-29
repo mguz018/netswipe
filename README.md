@@ -80,13 +80,36 @@ these are the usual suspects:
   verified against the installed SDK; if a future build renames them, the
   `receive_audio()` method is where to adjust.
 
-## Roadmap — Phase 2: tools / function calling
+## Tools
 
-Scaffolded in `main.py` but not yet wired into the live config:
+JARVIS can act, not just talk. Tools are toggled by the `ENABLE_*` flags at the
+top of `main.py`:
 
-- **Local-machine functions** — `open_app`, `read_file` (declarations and a
-  `handle_tool_call` dispatcher are stubbed in).
-- **Google Search grounding** — `types.Tool(google_search=...)`.
-- **Code execution** — `types.Tool(code_execution=...)`.
+- **Local-machine functions** (`ENABLE_LOCAL_FUNCTIONS`)
+  - `open_app(name)` — opens an application (cross-platform: `open -a` on macOS,
+    `start` on Windows, the binary or `xdg-open` on Linux).
+  - `read_file(path)` — reads a text file (`~` expanded, capped at 100 KB).
+  - These run on **your machine**, dispatched locally by `handle_tool_call()`,
+    and the result is returned to the model. See the security note below.
+- **Google Search grounding** (`ENABLE_GOOGLE_SEARCH`) — JARVIS can pull current
+  facts from the web. Resolved server-side.
+- **Code execution** (`ENABLE_CODE_EXECUTION`) — JARVIS can run code in a
+  sandbox to compute or verify things. Resolved server-side.
 
-To enable, fill in the handler bodies and uncomment `tools=TOOLS` in `CONFIG`.
+Each tool call is logged to the console (e.g. `[JARVIS: open_app({'name': 'Safari'})]`).
+
+> **Security note:** with local functions enabled, the model can open apps and
+> read files on your computer in response to what it hears on the mic. The
+> `read_file` handler is size-capped but **not** path-restricted. Tighten it
+> (whitelist directories) before using this anywhere untrusted, or set
+> `ENABLE_LOCAL_FUNCTIONS = False`.
+
+> **If the API rejects combining tools:** some preview models don't allow
+> function declarations alongside built-in tools in one session. If you see an
+> error to that effect on connect, turn off one of the `ENABLE_*` flags.
+
+### Adding your own function
+
+1. Write a handler returning a JSON-serializable `dict`.
+2. Register it in `TOOL_HANDLERS`.
+3. Add a `types.FunctionDeclaration` to `FUNCTION_DECLARATIONS`.

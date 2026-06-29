@@ -4,12 +4,18 @@ A single native-audio model takes microphone audio in and streams synthesized
 voice back out. There is deliberately no separate speech-to-text -> LLM ->
 text-to-speech pipeline; one model does all three.
 
+JARVIS can also act: open local applications, read local files, search the web
+(Google Search grounding), and run code (code execution). See the TOOLS section.
+
 Run:  python main.py
 Quit: Ctrl-C
 """
 
 import asyncio
 import os
+import platform
+import shutil
+import subprocess
 import sys
 import traceback
 
@@ -33,6 +39,12 @@ MODEL = "gemini-3.1-flash-live-preview"
 # SDK knows about so you can choose by ear — see list_available_voices().
 VOICE = "Charon"
 
+# Capabilities. Flip any of these off if the preview API rejects a combination
+# of tools, or if you'd rather not grant local-machine access.
+ENABLE_LOCAL_FUNCTIONS = True   # open_app, read_file (run on THIS machine)
+ENABLE_GOOGLE_SEARCH = True     # web grounding (server-side)
+ENABLE_CODE_EXECUTION = True    # sandboxed code execution (server-side)
+
 # The whole personality lives here. Edit freely.
 SYSTEM_INSTRUCTION = """\
 You are JARVIS, the personal assistant to Tony Stark.
@@ -47,6 +59,13 @@ Manner:
   same unruffled composure you bring to everything else.
 - You never break character. You never refer to yourself as a language model,
   an AI, or a program. You are simply JARVIS.
+
+Capabilities — use them naturally, without announcing the machinery:
+- You can open applications and read files on the user's computer.
+- You can search the web when current facts are needed.
+- You can run code to compute or verify things.
+When you take such an action, narrate it in a single understated clause
+("Opening it now, sir.") rather than describing function calls.
 
 Speak naturally, as if conversing aloud, because you are.\
 """
@@ -72,6 +91,123 @@ if not API_KEY:
 
 client = genai.Client(api_key=API_KEY)
 
+
+# --------------------------------------------------------------------------- #
+# Tools — Phase 2.
+#
+# Two kinds:
+#   * Local functions (open_app, read_file): declared to the model, dispatched
+#     by handle_tool_call() to the Python handlers below, and the result sent
+#     back via session.send_tool_response().
+#   * Built-in tools (Google Search, code execution): handled server-side; we
+#     just declare them. Their effects arrive folded into JARVIS's audio reply.
+# --------------------------------------------------------------------------- #
+
+MAX_READ_BYTES = 100_000  # cap how much of a file we hand back to the model
+
+
+def open_app(name: str) -> dict:
+    """Open an application on the local machine, cross-platform."""
+    system = platform.system()
+    try:
+        if system == "Darwin":  # macOS
+            subprocess.Popen(["open", "-a", name])
+        elif system == "Windows":
+            # `start` is a cmd builtin; the empty "" is the window title arg.
+            subprocess.Popen(["cmd", "/c", "start", "", name])
+        else:  # Linux and friends
+            if shutil.which(name):
+                subprocess.Popen(
+                    [name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            else:
+                subprocess.Popen(
+                    ["xdg-open", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+        return {"status": "ok", "opened": name}
+    except FileNotFoundError:
+        return {"status": "error", "error": f"Could not find a way to open '{name}'."}
+    except Exception as exc:  # noqa: BLE001 — report any failure to the model
+        return {"status": "error", "error": str(exc)}
+
+
+def read_file(path: str) -> dict:
+    """Read a text file from the local machine (size-capped)."""
+    try:
+        resolved = os.path.abspath(os.path.expanduser(path))
+        if not os.path.isfile(resolved):
+            return {"status": "error", "error": f"No such file: {path}"}
+        size = os.path.getsize(resolved)
+        with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read(MAX_READ_BYTES)
+        return {
+            "status": "ok",
+            "path": resolved,
+            "content": content,
+            "truncated": size > MAX_READ_BYTES,
+            "bytes": size,
+        }
+    except Exception as exc:  # noqa: BLE001 — report any failure to the model
+        return {"status": "error", "error": str(exc)}
+
+
+# Maps a declared function name -> the local Python handler that runs it.
+TOOL_HANDLERS = {
+    "open_app": open_app,
+    "read_file": read_file,
+}
+
+# Function declarations the model is told about.
+FUNCTION_DECLARATIONS = [
+    types.FunctionDeclaration(
+        name="open_app",
+        description="Open an application on the user's computer.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "name": types.Schema(
+                    type=types.Type.STRING,
+                    description="Name of the application to open, e.g. 'Safari'.",
+                ),
+            },
+            required=["name"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="read_file",
+        description="Read the contents of a text file on the user's computer.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "path": types.Schema(
+                    type=types.Type.STRING,
+                    description="Path to the file to read (~ is expanded).",
+                ),
+            },
+            required=["path"],
+        ),
+    ),
+]
+
+
+def build_tools() -> list:
+    """Assemble the tool list from the ENABLE_* capability flags."""
+    tools = []
+    if ENABLE_LOCAL_FUNCTIONS:
+        tools.append(types.Tool(function_declarations=FUNCTION_DECLARATIONS))
+    if ENABLE_GOOGLE_SEARCH:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
+    if ENABLE_CODE_EXECUTION:
+        tools.append(types.Tool(code_execution=types.ToolCodeExecution()))
+    return tools
+
+
+TOOLS = build_tools()
+
 # --------------------------------------------------------------------------- #
 # Live session configuration.
 # --------------------------------------------------------------------------- #
@@ -87,8 +223,7 @@ CONFIG = types.LiveConnectConfig(
     ),
     # Stream a text transcript of what JARVIS says so we can print it.
     output_audio_transcription=types.AudioTranscriptionConfig(),
-    # Phase 2 — tools. Scaffolded below; left out of the live config for now.
-    # tools=TOOLS,
+    tools=TOOLS,
 )
 
 
@@ -169,7 +304,7 @@ class Jarvis:
           - response.data ............................ raw 24 kHz PCM bytes
           - response.server_content.output_transcription.text ... spoken words
           - response.server_content.interrupted ...... user barged in
-          - response.tool_call ....................... Phase 2 function calls
+          - response.tool_call ....................... local function calls
         If a future preview renames these, this method is where to look.
         """
         while True:
@@ -193,7 +328,9 @@ class Jarvis:
                     if server_content.turn_complete:
                         print()  # newline after a complete spoken turn
 
-                # Phase 2 hook — see handle_tool_call() scaffold below.
+                # Local function calls (open_app / read_file). Built-in tools
+                # like Google Search and code execution resolve server-side and
+                # never arrive here.
                 if response.tool_call is not None:
                     await self.handle_tool_call(response.tool_call)
 
@@ -222,22 +359,24 @@ class Jarvis:
             stream.stop_stream()
             stream.close()
 
-    # ----- Phase 2 scaffold: tool / function calling ---------------------- #
+    # ----- tool / function calling ---------------------------------------- #
     async def handle_tool_call(self, tool_call) -> None:
-        """Dispatch model-requested function calls back to local handlers.
+        """Run model-requested local functions and return their results.
 
-        Not wired into CONFIG yet. When you enable `tools=TOOLS` above, this
-        receives types.LiveServerToolCall with a .function_calls list, runs the
-        matching Python handler from TOOL_HANDLERS, and returns the results via
-        session.send_tool_response(...). Left as a stub for the next phase.
+        Receives types.LiveServerToolCall (a .function_calls list), runs the
+        matching Python handler from TOOL_HANDLERS off the event loop, and
+        replies with session.send_tool_response(...).
         """
         responses = []
         for fc in tool_call.function_calls:
+            print(f"\n[JARVIS: {fc.name}({dict(fc.args or {})})]")
             handler = TOOL_HANDLERS.get(fc.name)
             if handler is None:
-                result = {"error": f"Unknown function: {fc.name}"}
+                result = {"status": "error", "error": f"Unknown function: {fc.name}"}
             else:
-                result = handler(**(fc.args or {}))
+                # Handlers do blocking I/O (subprocess, file reads); keep them
+                # off the audio event loop.
+                result = await asyncio.to_thread(handler, **(fc.args or {}))
             responses.append(
                 types.FunctionResponse(id=fc.id, name=fc.name, response=result)
             )
@@ -263,79 +402,18 @@ class Jarvis:
             self.audio.terminate()
 
 
-# --------------------------------------------------------------------------- #
-# Phase 2 scaffold — tool / function calling. NOT yet enabled.
-#
-# Roadmap:
-#   1. Local-machine functions (below): open_app, read_file.
-#   2. Google Search grounding: add types.Tool(google_search=types.GoogleSearch())
-#   3. Code execution:           add types.Tool(code_execution=types.ToolCodeExecution())
-#
-# To turn these on: uncomment `tools=TOOLS` in CONFIG above. Note that
-# google_search / code_execution are managed server-side, while the function
-# declarations below are dispatched locally through handle_tool_call().
-# --------------------------------------------------------------------------- #
-
-def open_app(name: str) -> dict:
-    """Stub: open an application on the local machine. Not implemented yet."""
-    # TODO: subprocess to `open -a` (mac) / `xdg-open` (linux) / `start` (win).
-    return {"status": "not_implemented", "requested": name}
-
-
-def read_file(path: str) -> dict:
-    """Stub: read a text file from the local machine. Not implemented yet."""
-    # TODO: validate/whitelist paths, then return file contents (size-capped).
-    return {"status": "not_implemented", "requested": path}
-
-
-# Maps a declared function name -> the local Python handler that runs it.
-TOOL_HANDLERS = {
-    "open_app": open_app,
-    "read_file": read_file,
-}
-
-# Function declarations the model is told about. Filled in next phase.
-FUNCTION_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name="open_app",
-        description="Open an application on the user's computer.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "name": types.Schema(
-                    type=types.Type.STRING,
-                    description="Name of the application to open.",
-                ),
-            },
-            required=["name"],
-        ),
-    ),
-    types.FunctionDeclaration(
-        name="read_file",
-        description="Read the contents of a text file on the user's computer.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "path": types.Schema(
-                    type=types.Type.STRING,
-                    description="Absolute path to the file to read.",
-                ),
-            },
-            required=["path"],
-        ),
-    ),
-]
-
-# The full tool list to drop into CONFIG when Phase 2 goes live.
-TOOLS = [
-    types.Tool(function_declarations=FUNCTION_DECLARATIONS),
-    # types.Tool(google_search=types.GoogleSearch()),          # grounding
-    # types.Tool(code_execution=types.ToolCodeExecution()),    # code execution
-]
-
-
 def main() -> None:
     list_available_voices()
+    enabled = [
+        name
+        for name, on in (
+            ("local functions", ENABLE_LOCAL_FUNCTIONS),
+            ("Google Search", ENABLE_GOOGLE_SEARCH),
+            ("code execution", ENABLE_CODE_EXECUTION),
+        )
+        if on
+    ]
+    print("Tools enabled: " + (", ".join(enabled) if enabled else "none") + "\n")
     try:
         asyncio.run(Jarvis().run())
     except KeyboardInterrupt:
