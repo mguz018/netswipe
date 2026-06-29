@@ -28,6 +28,7 @@ stops near-instantly. His words are also printed to the console as he speaks
 - **"JARVIS" wake word** — fully offline, with an audible wake chime.
 - **Tools** — open apps, read files, list directories, time, notifications,
   plus Google Search grounding and code execution.
+- **Persistent memory** — remembers durable facts about you across runs.
 - **Transcript logging** — both sides of every conversation, timestamped.
 - **Session resumption** — transparently reconnects (keeping context) when the
   Live API hits its connection limit or the network blips.
@@ -39,7 +40,26 @@ networks drop. With `SESSION_RESUMPTION_ENABLED` (default on), JARVIS asks the
 server for a resumption handle, and when a connection ends he **reconnects
 automatically using that handle** — so the conversation context carries over
 rather than resetting. Reconnects use exponential backoff (1s → 30s); a real
-Ctrl-C still exits cleanly.
+Ctrl-C still exits cleanly. Unrecoverable **4xx errors** (bad API key, unknown
+model, invalid config) are detected and **fail fast** instead of looping.
+
+## Persistent memory
+
+With `ENABLE_LOCAL_FUNCTIONS` on, JARVIS can remember durable facts about you
+between sessions. He calls `remember(fact)` when you share a lasting preference
+or detail (and `forget` / `list_memories` as needed); facts are stored in
+`memory.json` and folded into his system instruction at the start of each
+session, so the next run begins already knowing them.
+
+```
+You:    JARVIS, remember I take my coffee black.
+JARVIS: Noted, sir.
+        # ...next session...
+You:    Make me a coffee.
+JARVIS: Black, as always, sir.
+```
+
+`memory.json` is gitignored. Delete it to wipe his memory.
 
 ## Transcript logging
 
@@ -165,6 +185,8 @@ top of `main.py`:
   - `get_current_time()` — the current local date and time.
   - `send_notification(title, message)` — a desktop notification (`osascript`
     on macOS, `notify-send` on Linux, PowerShell balloon on Windows).
+  - `remember(fact)` / `forget(fact)` / `list_memories()` — persistent memory
+    across runs (see [Persistent memory](#persistent-memory)).
   - These run on **your machine**, dispatched locally by `handle_tool_call()`,
     and the result is returned to the model. See the security note below.
 - **Google Search grounding** (`ENABLE_GOOGLE_SEARCH`) — JARVIS can pull current

@@ -4,6 +4,9 @@
 # Conversation transcripts
 transcripts/
 
+# Persistent memory
+memory.json
+
 # Python
 __pycache__/
 *.py[cod]

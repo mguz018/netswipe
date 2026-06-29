@@ -13,6 +13,7 @@ Quit: Ctrl-C
 
 import array
 import asyncio
+import json
 import math
 import os
 import platform
@@ -25,7 +26,7 @@ import traceback
 import pyaudio
 from dotenv import load_dotenv
 from google import genai
-from google.genai import types
+from google.genai import errors, types
 
 try:
     import pvporcupine  # optional: only needed for the wake word
@@ -76,6 +77,11 @@ SESSION_RESUMPTION_ENABLED = True
 TRANSCRIPT_LOG_ENABLED = True
 TRANSCRIPT_DIR = "transcripts"
 
+# Persistent memory. JARVIS can remember durable facts about you across runs;
+# they're stored here and folded into his system instruction on startup.
+# (Part of the local-function tools — requires ENABLE_LOCAL_FUNCTIONS.)
+MEMORY_FILE = "memory.json"
+
 # The whole personality lives here. Edit freely.
 SYSTEM_INSTRUCTION = """\
 You are JARVIS, the personal assistant to Tony Stark.
@@ -95,6 +101,8 @@ Capabilities — use them naturally, without announcing the machinery:
 - You can open applications and read files on the user's computer.
 - You can search the web when current facts are needed.
 - You can run code to compute or verify things.
+- You can remember durable facts about the user. When he shares a lasting
+  preference, detail, or instruction worth keeping, quietly call remember.
 When you take such an action, narrate it in a single understated clause
 ("Opening it now, sir.") rather than describing function calls.
 
@@ -264,6 +272,51 @@ def send_notification(title: str, message: str) -> dict:
         return {"status": "error", "error": str(exc)}
 
 
+# ----- persistent memory ------------------------------------------------- #
+
+def load_memories() -> list:
+    """Load the user's remembered facts (empty list if none / unreadable)."""
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_memories(memories: list) -> None:
+    with open(MEMORY_FILE, "w", encoding="utf-8") as fh:
+        json.dump(memories, fh, indent=2, ensure_ascii=False)
+
+
+def remember(fact: str) -> dict:
+    """Persist a durable fact about the user for future sessions."""
+    fact = (fact or "").strip()
+    if not fact:
+        return {"status": "error", "error": "Nothing to remember."}
+    memories = load_memories()
+    if fact not in memories:
+        memories.append(fact)
+        save_memories(memories)
+    return {"status": "ok", "remembered": fact, "total": len(memories)}
+
+
+def forget(fact: str) -> dict:
+    """Forget remembered facts matching the given text (case-insensitive)."""
+    needle = (fact or "").strip().lower()
+    if not needle:
+        return {"status": "error", "error": "Nothing to forget."}
+    memories = load_memories()
+    kept = [m for m in memories if needle not in m.lower()]
+    save_memories(kept)
+    return {"status": "ok", "removed": len(memories) - len(kept), "total": len(kept)}
+
+
+def list_memories() -> dict:
+    """Return everything JARVIS currently remembers about the user."""
+    return {"status": "ok", "memories": load_memories()}
+
+
 # Maps a declared function name -> the local Python handler that runs it.
 TOOL_HANDLERS = {
     "open_app": open_app,
@@ -271,6 +324,9 @@ TOOL_HANDLERS = {
     "list_directory": list_directory,
     "get_current_time": get_current_time,
     "send_notification": send_notification,
+    "remember": remember,
+    "forget": forget,
+    "list_memories": list_memories,
 }
 
 # Function declarations the model is told about.
@@ -337,6 +393,42 @@ FUNCTION_DECLARATIONS = [
             required=["title", "message"],
         ),
     ),
+    types.FunctionDeclaration(
+        name="remember",
+        description=(
+            "Persist a durable fact, preference, or instruction about the user "
+            "so it is available in future sessions."
+        ),
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "fact": types.Schema(
+                    type=types.Type.STRING,
+                    description="The fact to remember, as a concise statement.",
+                ),
+            },
+            required=["fact"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="forget",
+        description="Forget previously remembered facts matching the given text.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "fact": types.Schema(
+                    type=types.Type.STRING,
+                    description="Text identifying which memory/memories to drop.",
+                ),
+            },
+            required=["fact"],
+        ),
+    ),
+    types.FunctionDeclaration(
+        name="list_memories",
+        description="List everything currently remembered about the user.",
+        parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+    ),
 ]
 
 
@@ -357,12 +449,24 @@ TOOLS = build_tools()
 # --------------------------------------------------------------------------- #
 # Live session configuration.
 # --------------------------------------------------------------------------- #
+def system_instruction_with_memory() -> str:
+    """SYSTEM_INSTRUCTION with any remembered facts appended."""
+    memories = load_memories() if ENABLE_LOCAL_FUNCTIONS else []
+    if not memories:
+        return SYSTEM_INSTRUCTION
+    facts = "\n".join(f"- {m}" for m in memories)
+    return (
+        f"{SYSTEM_INSTRUCTION}\n\n"
+        f"Things you already know about the user, from earlier sessions:\n{facts}"
+    )
+
+
 def build_config(resume_handle: str | None = None) -> types.LiveConnectConfig:
     """Build the Live config, optionally resuming a prior session by handle."""
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         system_instruction=types.Content(
-            parts=[types.Part(text=SYSTEM_INSTRUCTION)]
+            parts=[types.Part(text=system_instruction_with_memory())]
         ),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
@@ -737,6 +841,13 @@ class Jarvis:
                     if not SESSION_RESUMPTION_ENABLED:
                         if rest is not None:
                             self._report(rest)
+                        return
+                    # 4xx client errors (bad key, unknown model, invalid config)
+                    # won't fix themselves — fail fast instead of looping.
+                    fatal = [e for e in rest.exceptions if isinstance(e, errors.ClientError)]
+                    if fatal:
+                        print("\n[fatal error — not retrying]")
+                        self._report(rest)
                         return
                     # Otherwise treat it as a dropped connection and reconnect.
                     names = ", ".join(type(e).__name__ for e in rest.exceptions)
