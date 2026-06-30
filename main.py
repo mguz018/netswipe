@@ -62,8 +62,15 @@ ENABLE_CODE_EXECUTION = True    # sandboxed code execution (server-side)
 # Needs a free access key from https://console.picovoice.ai in PICOVOICE_ACCESS_KEY.
 # If the package or key is missing, JARVIS falls back to always-listening.
 WAKE_WORD_ENABLED = True
-WAKE_KEYWORD = "jarvis"          # any of pvporcupine.KEYWORDS
-WAKE_SENSITIVITY = 0.5           # 0..1; higher = more sensitive, more false wakes
+# Which wake-word engine to use:
+#   "auto"         - Porcupine if a Picovoice key is set, else openWakeWord
+#   "porcupine"    - Picovoice Porcupine (needs free PICOVOICE_ACCESS_KEY)
+#   "openwakeword" - openWakeWord: open-source, offline, NO account/key needed
+WAKE_ENGINE = "auto"
+WAKE_KEYWORD = "jarvis"          # Porcupine keyword (any of pvporcupine.KEYWORDS)
+WAKE_SENSITIVITY = 0.5           # Porcupine: 0..1; higher = more sensitive
+OPENWAKEWORD_MODEL = "hey_jarvis"  # openWakeWord pretrained model name
+OPENWAKEWORD_THRESHOLD = 0.5     # openWakeWord: 0..1 detection score cutoff
 SLEEP_AFTER_SILENCE = 12.0       # seconds of quiet before JARVIS dozes off again
 VOICE_RMS_THRESHOLD = 500        # mic loudness (int16 RMS) counted as "speech"
 WAKE_CHIME_ENABLED = True        # play a short rising tone when JARVIS wakes
@@ -593,36 +600,111 @@ def list_available_voices() -> None:
     print(f"Currently using: {VOICE}\n")
 
 
-def make_wake_detector():
-    """Create a Porcupine wake-word detector, or None for always-on listening.
+class PorcupineDetector:
+    """Wake detector backed by Picovoice Porcupine (needs a free access key)."""
 
-    Falls back gracefully (with an explanatory message) if the wake word is
-    disabled, the package is missing, the access key is unset, or init fails —
-    in every fallback case JARVIS simply listens continuously.
-    """
-    if not WAKE_WORD_ENABLED:
-        return None
+    def __init__(self, handle):
+        self._handle = handle
+        self.frame_length = handle.frame_length
+        self.phrase = WAKE_KEYWORD
+
+    def process(self, pcm) -> bool:
+        return self._handle.process(pcm) >= 0
+
+    def delete(self) -> None:
+        self._handle.delete()
+
+
+class OpenWakeWordDetector:
+    """Wake detector backed by openWakeWord — open-source, offline, no account."""
+
+    FRAME = 1280  # openWakeWord's native chunk: 80 ms @ 16 kHz
+
+    def __init__(self, model, threshold):
+        import numpy as np  # local: only needed for this backend
+
+        self._np = np
+        self._model = model
+        self._threshold = threshold
+        self.frame_length = self.FRAME
+        self.phrase = OPENWAKEWORD_MODEL.replace("_", " ")
+
+    def process(self, pcm) -> bool:
+        frame = self._np.array(pcm, dtype=self._np.int16)
+        scores = self._model.predict(frame)
+        return any(score >= self._threshold for score in scores.values())
+
+    def delete(self) -> None:
+        pass
+
+
+def _make_porcupine():
     if pvporcupine is None:
-        print(
-            "Wake word requested but 'pvporcupine' is not installed; JARVIS "
-            "will listen continuously.  (pip install pvporcupine)"
-        )
+        print("Porcupine requested but 'pvporcupine' is not installed.")
         return None
     if not PICOVOICE_ACCESS_KEY:
-        print(
-            "Wake word requested but PICOVOICE_ACCESS_KEY is not set; JARVIS "
-            "will listen continuously.  (Free key: https://console.picovoice.ai)"
-        )
+        print("Porcupine requested but PICOVOICE_ACCESS_KEY is not set.")
         return None
     try:
-        return pvporcupine.create(
+        handle = pvporcupine.create(
             access_key=PICOVOICE_ACCESS_KEY,
             keywords=[WAKE_KEYWORD],
             sensitivities=[WAKE_SENSITIVITY],
         )
+        print(f'Wake word ready (Porcupine, "{WAKE_KEYWORD}").')
+        return PorcupineDetector(handle)
     except Exception as exc:  # noqa: BLE001 — never let wake-word setup be fatal
-        print(f"Could not initialise wake word ({exc}); listening continuously.")
+        print(f"Could not initialise Porcupine ({exc}).")
         return None
+
+
+def _make_openwakeword():
+    try:
+        import numpy  # noqa: F401
+        from openwakeword import utils
+        from openwakeword.model import Model
+    except ImportError:
+        print("openWakeWord requested but not installed.  (pip install openwakeword)")
+        return None
+    try:
+        # One-time download of the pretrained models into openWakeWord's cache.
+        utils.download_models([OPENWAKEWORD_MODEL])
+        model = Model(
+            wakeword_models=[OPENWAKEWORD_MODEL], inference_framework="onnx"
+        )
+        phrase = OPENWAKEWORD_MODEL.replace("_", " ")
+        print(f'Wake word ready (openWakeWord, "{phrase}").')
+        return OpenWakeWordDetector(model, OPENWAKEWORD_THRESHOLD)
+    except Exception as exc:  # noqa: BLE001 — never let wake-word setup be fatal
+        print(f"Could not initialise openWakeWord ({exc}).")
+        return None
+
+
+def make_wake_detector():
+    """Create a wake-word detector, or None for always-on listening.
+
+    WAKE_ENGINE selects the backend; "auto" prefers Porcupine when an access
+    key is present, otherwise openWakeWord. Every failure path falls back to
+    continuous listening with an explanatory message — never fatal.
+    """
+    if not WAKE_WORD_ENABLED:
+        return None
+
+    engine = WAKE_ENGINE
+    if engine == "auto":
+        engine = "porcupine" if (pvporcupine and PICOVOICE_ACCESS_KEY) else "openwakeword"
+
+    detector = None
+    if engine == "porcupine":
+        detector = _make_porcupine()
+    elif engine == "openwakeword":
+        detector = _make_openwakeword()
+    else:
+        print(f'Unknown WAKE_ENGINE "{WAKE_ENGINE}".')
+
+    if detector is None:
+        print("JARVIS will listen continuously.")
+    return detector
 
 
 def _rms(pcm) -> float:
@@ -659,8 +741,8 @@ class Jarvis:
         # Model audio waiting to be played to the speaker.
         self.audio_in_queue: asyncio.Queue = asyncio.Queue()
         # Wake word. With no detector, JARVIS is always awake.
-        self.porcupine = make_wake_detector()
-        self.awake = self.porcupine is None
+        self.detector = make_wake_detector()
+        self.awake = self.detector is None
         self.last_interaction = time.monotonic()
         # Session resumption: handle issued by the server, reused on reconnect.
         self.resume_handle: str | None = None
@@ -726,8 +808,8 @@ class Jarvis:
     # ----- task 1: capture microphone ------------------------------------- #
     async def capture_mic(self) -> None:
         mic_info = self.audio.get_default_input_device_info()
-        # Porcupine must be fed its exact frame length; otherwise any size works.
-        frame_length = self.porcupine.frame_length if self.porcupine else CHUNK_SIZE
+        # A detector must be fed its exact frame length; otherwise any size works.
+        frame_length = self.detector.frame_length if self.detector else CHUNK_SIZE
         stream = await asyncio.to_thread(
             self.audio.open,
             format=FORMAT,
@@ -737,8 +819,8 @@ class Jarvis:
             input_device_index=mic_info["index"],
             frames_per_buffer=frame_length,
         )
-        if self.porcupine:
-            print(f'Asleep. Say "{WAKE_KEYWORD}" to wake me, sir.\n')
+        if self.detector:
+            print(f'Asleep. Say "{self.detector.phrase}" to wake me, sir.\n')
         else:
             print("Listening, sir.\n")
         try:
@@ -747,16 +829,16 @@ class Jarvis:
                     stream.read, frame_length, exception_on_overflow=False
                 )
 
-                if self.porcupine:
-                    # A short/partial read would make array.array raise and
-                    # Porcupine reject the frame; just skip it.
+                if self.detector:
+                    # A short/partial read would make array.array raise and the
+                    # detector reject the frame; just skip it.
                     if len(data) != frame_length * 2:
                         continue
                     pcm = array.array("h", data)
 
                     # Asleep: listen only for the wake word; stream nothing.
                     if not self.awake:
-                        if self.porcupine.process(pcm) >= 0:
+                        if self.detector.process(pcm):
                             self.wake_up()
                         continue
 
@@ -881,7 +963,7 @@ class Jarvis:
 
     async def sleep_monitor(self) -> None:
         """Return JARVIS to sleep after a quiet spell. No-op without a detector."""
-        if not self.porcupine:
+        if not self.detector:
             return
         while True:
             await asyncio.sleep(0.5)
@@ -889,7 +971,7 @@ class Jarvis:
             if self.awake and quiet_for > SLEEP_AFTER_SILENCE:
                 self.awake = False
                 self._drain_output()
-                print(f'\n○ Standing by. Say "{WAKE_KEYWORD}" to wake me, sir.\n')
+                print(f'\n○ Standing by. Say "{self.detector.phrase}" to wake me, sir.\n')
                 self._log("[sleep]")
 
     # ----- task 4: play model audio to the speaker ------------------------ #
@@ -993,8 +1075,8 @@ class Jarvis:
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
-            if self.porcupine:
-                self.porcupine.delete()
+            if self.detector:
+                self.detector.delete()
             if self.log_file:
                 self.log_file.close()
             self.audio.terminate()
@@ -1011,7 +1093,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     p.add_argument("--model", help=f"Gemini Live model (default: {MODEL})")
     p.add_argument("--voice", help=f"prebuilt voice (default: {VOICE})")
-    p.add_argument("--keyword", help=f"wake word (default: {WAKE_KEYWORD})")
+    p.add_argument(
+        "--wake-engine",
+        choices=["auto", "porcupine", "openwakeword"],
+        help=f"wake-word backend (default: {WAKE_ENGINE})",
+    )
+    p.add_argument("--keyword", help=f"Porcupine wake word (default: {WAKE_KEYWORD})")
     p.add_argument("--sensitivity", type=float, help="wake-word sensitivity 0..1")
     p.add_argument("--sleep-after", type=float, help="seconds of quiet before sleep")
     p.add_argument("--no-wake-word", action="store_true", help="listen continuously")
@@ -1033,10 +1120,13 @@ def apply_overrides(a: argparse.Namespace) -> None:
     global WAKE_WORD_ENABLED, WAKE_CHIME_ENABLED, TRANSCRIPT_LOG_ENABLED
     global SESSION_RESUMPTION_ENABLED, ENABLE_LOCAL_FUNCTIONS, ENABLE_GOOGLE_SEARCH
     global ENABLE_CODE_EXECUTION, ENABLE_SHELL, WAKE_CHIME, EXIT_SUMMARY_ENABLED
+    global WAKE_ENGINE
     if a.model:
         MODEL = a.model
     if a.voice:
         VOICE = a.voice
+    if a.wake_engine:
+        WAKE_ENGINE = a.wake_engine
     if a.keyword:
         WAKE_KEYWORD = a.keyword
     if a.sensitivity is not None:
@@ -1076,7 +1166,7 @@ def main() -> None:
     ]
     print("Tools enabled: " + (", ".join(enabled) if enabled else "none"))
     if WAKE_WORD_ENABLED:
-        print(f'Wake word: "{WAKE_KEYWORD}"')
+        print(f"Wake word: on (engine: {WAKE_ENGINE})")
     extras = [
         name
         for name, on in (

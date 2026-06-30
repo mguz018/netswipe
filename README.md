@@ -141,34 +141,46 @@ of defaults.
 ## Wake word — "JARVIS"
 
 By default JARVIS doesn't stream a thing until he hears his name. Wake-word
-detection runs **fully offline** via [Picovoice Porcupine](https://picovoice.ai/),
-which ships `"jarvis"` as one of its built-in keywords — no custom model needed.
+detection runs **fully offline**, and there are two interchangeable engines —
+pick whichever suits you (or neither, and run `--no-wake-word`):
+
+| Engine | Account/key? | Wake phrase | Notes |
+|--------|-------------|-------------|-------|
+| **openWakeWord** | **None** — open-source | **"hey jarvis"** | Ships a pretrained model; downloads it once on first run. The no-signup default. |
+| **Porcupine** | Free Picovoice key | "jarvis" | Slightly crisper detection; needs `PICOVOICE_ACCESS_KEY`. |
+
+`WAKE_ENGINE` selects the backend (`"auto"` by default: Porcupine if a key is
+set, otherwise openWakeWord).
 
 How it behaves:
 
 1. **Asleep** — the mic is read locally and checked for the wake word; nothing
    is sent to the model.
-2. Say **"JARVIS"** → a short chime plays, he wakes (`● Yes, sir?`), and starts
-   streaming to the model. (Chime toggled by `WAKE_CHIME_ENABLED`.)
+2. Say the wake phrase → a short chime plays, he wakes (`● Yes, sir?`), and
+   starts streaming to the model. (Chime toggled by `WAKE_CHIME_ENABLED`.)
 3. Talk normally. He stays awake while you're speaking and while he's replying.
 4. After `SLEEP_AFTER_SILENCE` seconds of quiet he dozes off again
-   (`○ Standing by.`) until the next "JARVIS".
+   (`○ Standing by.`) until the next wake.
 
 ### Setup
 
-1. Add `pvporcupine` (already in `requirements.txt`).
-2. Get a **free** access key at https://console.picovoice.ai and put it in
-   `.env` as `PICOVOICE_ACCESS_KEY`.
+**openWakeWord (no account):** it's in `requirements.txt`; nothing else to do.
+The "hey jarvis" model downloads automatically on first run.
 
-If the package or key is missing, JARVIS prints a notice and simply
-**listens continuously** — the wake word is a convenience, not a hard
-dependency.
+**Porcupine (optional):** get a **free** key at https://console.picovoice.ai,
+put it in `.env` as `PICOVOICE_ACCESS_KEY`, and it'll be used automatically.
+
+If no engine is available, JARVIS prints a notice and simply **listens
+continuously** — the wake word is a convenience, not a hard dependency.
 
 ### Knobs (top of `main.py`)
 
 - `WAKE_WORD_ENABLED` — turn the wake word on/off
-- `WAKE_KEYWORD` — any of `pvporcupine.KEYWORDS` (e.g. `"computer"`, `"jarvis"`)
-- `WAKE_SENSITIVITY` — `0..1`; higher catches more, with more false wakes
+- `WAKE_ENGINE` — `"auto"` / `"porcupine"` / `"openwakeword"` (or `--wake-engine`)
+- `OPENWAKEWORD_MODEL` — pretrained model, e.g. `"hey_jarvis"`, `"alexa"`
+- `OPENWAKEWORD_THRESHOLD` — `0..1` detection score cutoff
+- `WAKE_KEYWORD` — Porcupine keyword (any of `pvporcupine.KEYWORDS`)
+- `WAKE_SENSITIVITY` — Porcupine `0..1`; higher catches more, more false wakes
 - `SLEEP_AFTER_SILENCE` — seconds of quiet before he sleeps again
 - `VOICE_RMS_THRESHOLD` — mic loudness counted as speech (keeps him awake)
 
