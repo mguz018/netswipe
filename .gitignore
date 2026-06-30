@@ -1,0 +1,16 @@
+# Secrets
+.env
+
+# Conversation transcripts
+transcripts/
+
+# Persistent memory
+memory.json
+memory.json.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/

@@ -1,0 +1,9 @@
+google-genai>=2.10.0
+pyaudio>=0.2.14
+python-dotenv>=1.0.0
+
+# Wake word — pick at least one (or neither, and run with --no-wake-word):
+#   openWakeWord: open-source, offline, no account/key. Ships a "hey jarvis" model.
+openwakeword>=0.6.0
+#   Picovoice Porcupine: needs a free access key from https://console.picovoice.ai
+pvporcupine>=3.0.0
